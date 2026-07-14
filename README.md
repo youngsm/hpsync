@@ -1,12 +1,12 @@
-# hpsync
+# hpsync = hpc + sync
 
-`hpsync`, a portmanteau of **hpc** and **sync**, safely synchronizes
-**uncommitted Git work** across any number of worktrees on your local computer
+`hpsync` safely synchronizes
+uncommitted Git work across any number of worktrees on your local computer
 and SSH-accessible machines.
 
 It is designed for work that is not ready to commit but needs to follow you
-between a laptop, workstation, login node, or compute site. Every location is
-configured by name; there are no built-in hosts or repository paths.
+between a laptop, workstation, login node, or compute site. Each
+worktree is assumed to be at the same commit.
 
 ## Safety model
 
@@ -172,11 +172,8 @@ several locations contain the same changed version, they agree and that version
 still propagates. If changed locations disagree, the path is reported as a
 conflict and the synchronization is blocked.
 
-Committed history is deliberately out of scope. If locations have different
-`HEAD` commits, align them with your normal Git workflow before running
+If locations have different `HEAD` commits, you must align them with your normal Git workflow before running
 `hpsync` again.
-
-Pressing `Ctrl-C` cancels setup or synchronization cleanly without a traceback.
 
 ## Development
 
