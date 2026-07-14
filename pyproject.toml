@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hpsync"
-version = "0.1.0"
+version = "0.2.0"
 description = "Safely synchronize uncommitted work across local and SSH Git worktrees."
 requires-python = ">=3.10"
 readme = "README.md"
