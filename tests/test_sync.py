@@ -84,6 +84,64 @@ class SshCommandTests(unittest.TestCase):
 
 
 class LocalSyncTests(unittest.TestCase):
+    def test_bootstrap_creates_a_missing_local_checkout_without_an_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            origin = root / "origin.git"
+            subprocess.run(
+                ["git", "init", "--bare", "-q", "-b", "main", str(origin)],
+                check=True,
+                capture_output=True,
+            )
+            source = root / "source"
+            subprocess.run(
+                ["git", "clone", "-q", str(origin), str(source)],
+                check=True,
+                capture_output=True,
+            )
+            git(source, "config", "user.name", "Test User")
+            git(source, "config", "user.email", "test@example.com")
+            (source / "file.txt").write_text("base\n", encoding="utf-8")
+            git(source, "add", "file.txt")
+            git(source, "commit", "-qm", "base")
+            git(source, "push", "-q", "origin", "HEAD")
+            git(source, "remote", "remove", "origin")
+
+            missing = root / "missing"
+            config = hpsync.default_config()
+            hpsync.add_repo(config, "project")
+            hpsync.add_location(
+                config,
+                "project",
+                {"name": "local", "transport": "local", "path": str(missing)},
+            )
+            hpsync.add_location(
+                config,
+                "project",
+                {"name": "source", "transport": "local", "path": str(source)},
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                ready = hpsync.bootstrap_repository(
+                    config["repositories"][0], assume_yes=True
+                )
+
+            self.assertTrue(ready)
+            local_identity = hpsync.local_repo_identity(
+                hpsync.location_from_dict(config["repositories"][0]["locations"][0])
+            )
+            source_identity = hpsync.local_repo_identity(
+                hpsync.location_from_dict(config["repositories"][0]["locations"][1])
+            )
+            assert local_identity is not None
+            assert source_identity is not None
+            self.assertEqual(
+                local_identity.head,
+                source_identity.head,
+            )
+            self.assertEqual(local_identity.origin, "")
+            self.assertEqual((missing / "file.txt").read_text(encoding="utf-8"), "base\n")
+
     def test_syncs_three_local_worktrees_and_creates_backups(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

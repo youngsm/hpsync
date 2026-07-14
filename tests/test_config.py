@@ -1,14 +1,28 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import hpsync
 
 
 class ConfigTests(unittest.TestCase):
+    def test_keyboard_interrupt_is_a_clean_cancellation(self) -> None:
+        error_output = io.StringIO()
+        with (
+            mock.patch.object(hpsync, "config_wizard", side_effect=KeyboardInterrupt),
+            contextlib.redirect_stderr(error_output),
+        ):
+            result = hpsync.main(["config"])
+
+        self.assertEqual(result, 130)
+        self.assertIn("Cancelled", error_output.getvalue())
+
     def test_adds_local_and_ssh_locations(self) -> None:
         config = hpsync.default_config()
         hpsync.add_repo(config, "project")
@@ -78,6 +92,53 @@ class ConfigTests(unittest.TestCase):
             hpsync.save_config(config, path)
             self.assertEqual(hpsync.load_config(path), config)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_wizard_always_adds_an_explained_local_copy(self) -> None:
+        answers = iter(
+            [
+                "project",
+                "/tmp/local-project",
+                "",
+                "",
+                "user@cluster.example.org",
+                "",
+                "/work/project",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            output = io.StringIO()
+            with (
+                mock.patch("builtins.input", side_effect=lambda _prompt: next(answers)),
+                mock.patch.object(hpsync, "bootstrap_config") as bootstrap,
+                contextlib.redirect_stdout(output),
+            ):
+                hpsync.config_wizard(path)
+
+            config = hpsync.load_config(path)
+            locations = config["repositories"][0]["locations"]
+            self.assertEqual(
+                locations[0],
+                {
+                    "name": "local",
+                    "transport": "local",
+                    "path": "/tmp/local-project",
+                    "state": "~/.local/state/hpsync",
+                },
+            )
+            self.assertEqual(locations[1]["name"], "cluster")
+            self.assertIn("short label", output.getvalue())
+            self.assertIn("safety copies", output.getvalue())
+            self.assertIn("-" * 71, output.getvalue())
+            bootstrap.assert_called_once_with(config)
+            self.assertIn("Setup always includes a local copy", output.getvalue())
 
 
 if __name__ == "__main__":

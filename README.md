@@ -1,7 +1,8 @@
 # hpsync
 
-`hpsync` safely synchronizes **uncommitted Git work** across any number of
-worktrees on your local computer and SSH-accessible machines.
+`hpsync`, a portmanteau of **hpc** and **sync**, safely synchronizes
+**uncommitted Git work** across any number of worktrees on your local computer
+and SSH-accessible machines.
 
 It is designed for work that is not ready to commit but needs to follow you
 between a laptop, workstation, login node, or compute site. Every location is
@@ -41,6 +42,24 @@ Run the interactive setup:
 hpsync config
 ```
 
+The wizard separates each question with a terminal-width dim gray rule and
+explains each value as it asks for it. In short:
+
+- **Repository name** is a label for the project, such as `pimm`.
+- **Location name** is a label for a computer or site, such as `local`, `nersc`,
+  or `s3df`.
+- **Transport** is `local` for a path on this computer or `ssh` for another
+  machine.
+- **Repository path** is where the Git checkout exists or should be created on
+  that machine.
+- **Backup path** is where safety archives are stored before files are replaced.
+
+Setup always adds a location named `local`. At least one configured location
+must already contain the repository, but the local copy or any remote copy may
+be missing. The wizard detects missing checkouts and offers to clone them from
+an existing location using a temporary Git bundle. An existing checkout does
+not need a Git `origin` for this initial bootstrap.
+
 The default configuration is `~/.config/hpsync/config.json`. Override it with
 `HPSYNC_CONFIG` or the global `--config PATH` option.
 
@@ -79,6 +98,7 @@ Useful configuration commands:
 hpsync config show
 hpsync config validate
 hpsync config path
+hpsync config bootstrap
 hpsync config remove-location my-project cluster
 hpsync config remove-repo my-project
 ```
@@ -155,6 +175,8 @@ conflict and the synchronization is blocked.
 Committed history is deliberately out of scope. If locations have different
 `HEAD` commits, align them with your normal Git workflow before running
 `hpsync` again.
+
+Pressing `Ctrl-C` cancels setup or synchronization cleanly without a traceback.
 
 ## Development
 

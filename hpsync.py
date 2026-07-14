@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -119,6 +120,14 @@ class SyncPlan:
     conflicts: list[str]
     converged: list[str]
     excluded: list[str]
+
+
+@dataclasses.dataclass(frozen=True)
+class RepoIdentity:
+    root: str
+    head: str
+    branch: str
+    origin: str
 
 
 def default_config() -> dict[str, Any]:
@@ -514,11 +523,13 @@ class SshConnection:
         self,
         command: list[str],
         *,
+        check: bool = True,
         capture_output: bool = False,
         input_data: bytes | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
         return run(
             self.command(command),
+            check=check,
             capture_output=capture_output,
             input_data=input_data,
         )
@@ -551,6 +562,213 @@ def ensure_authentication(location: Location) -> None:
     subprocess.run(list(location.auth_command), check=True)
     if subprocess.run(probe, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
         raise RuntimeError(f"Authentication for {location.name} still fails")
+
+
+REMOTE_IDENTITY = r"""
+import json, os, subprocess, sys
+path = os.path.expanduser(sys.argv[1])
+def git(*args):
+    return subprocess.run(["git", "-C", path, *args], stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE)
+inside = git("rev-parse", "--is-inside-work-tree")
+if inside.returncode:
+    print(json.dumps(None))
+else:
+    root = git("rev-parse", "--show-toplevel").stdout.decode().strip()
+    head = git("rev-parse", "HEAD").stdout.decode().strip()
+    branch = git("symbolic-ref", "--short", "-q", "HEAD").stdout.decode().strip()
+    origin = git("remote", "get-url", "origin").stdout.decode().strip()
+    print(json.dumps({"root": root, "head": head,
+                      "branch": branch or "DETACHED", "origin": origin}))
+"""
+
+
+REMOTE_CLONE_BUNDLE = r"""
+import os, subprocess, sys, tempfile
+from pathlib import Path
+origin, head = sys.argv[1], sys.argv[2]
+path = os.path.expanduser(sys.argv[3])
+Path(path).parent.mkdir(parents=True, exist_ok=True)
+with tempfile.NamedTemporaryFile(prefix="hpsync-", suffix=".bundle") as bundle:
+    while True:
+        chunk = sys.stdin.buffer.read(1024 * 1024)
+        if not chunk:
+            break
+        bundle.write(chunk)
+    bundle.flush()
+    subprocess.run(["git", "clone", "--quiet", bundle.name, path], check=True)
+if origin:
+    subprocess.run(["git", "-C", path, "remote", "set-url", "origin", origin], check=True)
+else:
+    subprocess.run(["git", "-C", path, "remote", "remove", "origin"], check=True)
+current = subprocess.run(["git", "-C", path, "rev-parse", "HEAD"], check=True,
+                         stdout=subprocess.PIPE).stdout.decode().strip()
+if current != head:
+    subprocess.run(["git", "-C", path, "checkout", "--quiet", "--detach", head], check=True)
+"""
+
+
+def local_repo_identity(location: Location) -> RepoIdentity | None:
+    path = str(Path(location.path).expanduser())
+    inside = subprocess.run(
+        ["git", "-C", path, "rev-parse", "--is-inside-work-tree"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if inside.returncode:
+        return None
+    return RepoIdentity(
+        root=os.fsdecode(git(path, "rev-parse", "--show-toplevel")).strip(),
+        head=os.fsdecode(git(path, "rev-parse", "HEAD")).strip(),
+        branch=os.fsdecode(
+            git(path, "symbolic-ref", "--short", "-q", "HEAD", check=False)
+        ).strip()
+        or "DETACHED",
+        origin=os.fsdecode(git(path, "remote", "get-url", "origin", check=False)).strip(),
+    )
+
+
+def remote_repo_identity(
+    location: Location, connection: SshConnection
+) -> RepoIdentity | None:
+    result = connection.run(
+        [location.python, "-c", REMOTE_IDENTITY, location.path],
+        capture_output=True,
+    )
+    lines = result.stdout.splitlines()
+    if not lines:
+        raise RuntimeError(f"{location.name} returned no repository information")
+    data = json.loads(lines[-1])
+    return RepoIdentity(**data) if data else None
+
+
+def location_repo_identity(
+    location: Location, connections: dict[str, SshConnection]
+) -> RepoIdentity | None:
+    if location.is_local:
+        return local_repo_identity(location)
+    return remote_repo_identity(location, connections[location.name])
+
+
+@contextlib.contextmanager
+def repository_bundle(
+    location: Location,
+    source: RepoIdentity,
+    connections: dict[str, SshConnection],
+) -> Iterable[Path]:
+    with tempfile.NamedTemporaryFile(prefix="hpsync-", suffix=".bundle") as bundle:
+        command = ["git", "-C", source.root, "bundle", "create", "-", "--all"]
+        if not location.is_local:
+            command = connections[location.name].command(command)
+        result = subprocess.run(command, stdout=bundle)
+        if result.returncode:
+            raise RuntimeError(f"Could not create a Git bundle from {location.name}")
+        bundle.flush()
+        yield Path(bundle.name)
+
+
+def clone_bundle_to_location(
+    location: Location,
+    source: RepoIdentity,
+    bundle: Path,
+    connections: dict[str, SshConnection],
+) -> None:
+    progress(f"Creating repository at {location.name}:{location.path}")
+    if location.is_local:
+        path = Path(location.path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "clone", "--quiet", str(bundle), str(path)], check=True)
+        if source.origin:
+            git(str(path), "remote", "set-url", "origin", source.origin)
+        else:
+            git(str(path), "remote", "remove", "origin")
+        current = os.fsdecode(git(str(path), "rev-parse", "HEAD")).strip()
+        if current != source.head:
+            subprocess.run(
+                ["git", "-C", str(path), "checkout", "--quiet", "--detach", source.head],
+                check=True,
+            )
+    else:
+        try:
+            with bundle.open("rb") as stream:
+                subprocess.run(
+                    connections[location.name].command(
+                        [
+                            location.python,
+                            "-c",
+                            REMOTE_CLONE_BUNDLE,
+                            source.origin,
+                            source.head,
+                            location.path,
+                        ]
+                    ),
+                    check=True,
+                    stdin=stream,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+        except subprocess.CalledProcessError as error:
+            detail = error.stderr.decode(errors="replace").strip() if error.stderr else ""
+            suffix = f": {detail}" if detail else ""
+            raise RuntimeError(f"Could not create {location.name}:{location.path}{suffix}") from error
+    success(f"Created {location.name}:{location.path}")
+
+
+def bootstrap_repository(repo: dict[str, Any], assume_yes: bool = False) -> bool:
+    locations = select_locations(repo, None)
+    if len(locations) < 2:
+        raise ConfigError(f"Repository {repo['name']} needs a local copy and another location")
+    with contextlib.ExitStack() as stack:
+        connections: dict[str, SshConnection] = {}
+        for location in locations:
+            if not location.is_local:
+                ensure_authentication(location)
+                connections[location.name] = stack.enter_context(SshConnection(location))
+        identities = {
+            location.name: location_repo_identity(location, connections)
+            for location in locations
+        }
+        existing = [location for location in locations if identities[location.name] is not None]
+        missing = [location for location in locations if identities[location.name] is None]
+        for location in existing:
+            print(f"  found    {location.name}: {location.path}")
+        for location in missing:
+            print(f"  missing  {location.name}: {location.path}")
+        if not existing:
+            raise ConfigError(
+                f"No configured location contains repository {repo['name']}; at least one copy must exist"
+            )
+        heads = {identities[location.name].head for location in existing if identities[location.name]}
+        if len(heads) != 1:
+            raise RuntimeError(
+                f"Existing copies of {repo['name']} are on different commits; align them before setup"
+            )
+        if not missing:
+            success(f"Every location already has {repo['name']}")
+            return True
+        source_location = existing[0]
+        source = identities[source_location.name]
+        assert source is not None
+        if not assume_yes and not prompt_yes_no(
+            f"Create {len(missing)} missing checkout(s) from {source_location.name}?",
+            default=True,
+        ):
+            warning("Missing checkouts were not created")
+            return False
+        with repository_bundle(source_location, source, connections) as bundle:
+            for location in missing:
+                clone_bundle_to_location(location, source, bundle, connections)
+        return True
+
+
+def bootstrap_config(
+    config: dict[str, Any], repositories: Iterable[str] | None = None, assume_yes: bool = False
+) -> bool:
+    ready = True
+    for repo in select_repositories(config, repositories):
+        print(f"\n{title('Checking ' + repo['name'])}")
+        ready = bootstrap_repository(repo, assume_yes) and ready
+    return ready
 
 
 def probe_remote(
@@ -972,9 +1190,15 @@ def cmd_worktrees(args: argparse.Namespace) -> int:
     return result
 
 
+def question_separator() -> None:
+    width = max(12, shutil.get_terminal_size(fallback=(72, 24)).columns - 1)
+    print(styled("-" * width, "90"))
+
+
 def prompt(label: str, default: str | None = None, required: bool = True) -> str:
     suffix = f" [{default}]" if default else ""
     while True:
+        question_separator()
         value = input(f"{label}{suffix}: ").strip()
         if value:
             return value
@@ -986,44 +1210,125 @@ def prompt(label: str, default: str | None = None, required: bool = True) -> str
 
 def prompt_yes_no(label: str, default: bool = False) -> bool:
     marker = "Y/n" if default else "y/N"
+    question_separator()
     value = input(f"{label} [{marker}]: ").strip().lower()
     return default if not value else value in {"y", "yes"}
 
 
+def suggested_local_repo_path(repo_name: str) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    if result.returncode == 0:
+        return result.stdout.strip()
+    return f"~/code/{repo_name}"
+
+
+def location_name_from_host(host: str) -> str:
+    return host.rsplit("@", 1)[-1].split(".", 1)[0] or "remote"
+
+
 def config_wizard(path: Path) -> None:
     print(f"\n{title('hpsync configuration')}")
-    print(f"  {path}\n")
+    print(
+        f"  {path}\n\n"
+        "Setup always includes a local copy. At least one location must already\n"
+        "contain the repository; any other local or remote copies may be missing\n"
+        "and can be created during setup.\n"
+    )
     if path.exists() and not prompt_yes_no("Replace the existing configuration?"):
         warning("Configuration unchanged")
         return
     config = default_config()
     while True:
-        repo_name = prompt("Repository name")
+        print(
+            "Repository name is a short label for the project. It does not need "
+            "to match GitHub.\n  Example: pimm\n"
+        )
+        repo_name = prompt("Repository name", Path.cwd().name)
         add_repo(config, repo_name)
         repo = require_repo(config, repo_name)
+
+        print(
+            "\nLocal copy\n"
+            "  hpsync always configures a copy on this computer. The repository path\n"
+            "  is the directory where that Git checkout exists or should be created.\n"
+            "  Run 'pwd' inside an existing checkout if you are unsure.\n"
+        )
+        local_path = prompt("Local repository path", suggested_local_repo_path(repo_name))
+        add_location(
+            config,
+            repo_name,
+            {
+                "name": "local",
+                "transport": "local",
+                "path": local_path,
+                "state": DEFAULT_STATE_PATH,
+            },
+        )
+        print(
+            "  Location name: local (a label for this computer)\n"
+            f"  Backup path: {DEFAULT_STATE_PATH} (safety copies before files are replaced)\n"
+        )
+
         while True:
-            location_name = prompt("Location name")
-            transport = prompt("Transport (local/ssh)", "local")
+            if not prompt_yes_no(
+                "Add another location?", default=len(repo["locations"]) < 2
+            ):
+                if len(repo["locations"]) < 2:
+                    warning("At least two locations are needed to synchronize")
+                    continue
+                break
+            print(
+                "\nAnother location\n"
+                "  Transport says how this computer reaches it: 'ssh' for another\n"
+                "  machine or site, and 'local' for another path on this computer.\n"
+            )
+            transport = prompt("Transport (ssh/local)", "ssh")
             if transport not in {"local", "ssh"}:
                 warning("Transport must be local or ssh")
                 continue
+            host = ""
+            if transport == "ssh":
+                host = prompt("SSH host or alias (the name you pass to ssh)")
+                default_name = location_name_from_host(host)
+            else:
+                default_name = f"local-{len(repo['locations']) + 1}"
+            print("  Location name is only a memorable label, such as nersc or s3df.")
+            location_name = prompt("Location name", default_name)
+            print(
+                "  Repository path is where this same Git repository exists or should\n"
+                "  be created at that location.\n"
+            )
             location: dict[str, Any] = {
                 "name": location_name,
                 "transport": transport,
                 "path": prompt("Repository path"),
-                "state": prompt("Backup/state path", DEFAULT_STATE_PATH),
             }
             if transport == "ssh":
-                location["host"] = prompt("SSH host or alias")
+                location["host"] = host
+                print(
+                    "  Backup path stores safety archives on that machine. A scratch\n"
+                    "  directory is a good choice on an HPC system.\n"
+                )
+                location["state"] = prompt("Backup path", DEFAULT_STATE_PATH)
                 port = prompt("SSH port", required=False)
                 if port:
                     location["port"] = int(port)
                 auth = prompt("Authentication refresh command", required=False)
                 if auth:
                     location["auth_command"] = shlex.split(auth)
+            else:
+                location["state"] = DEFAULT_STATE_PATH
             add_location(config, repo_name, location)
-            if not prompt_yes_no("Add another location?", default=len(repo["locations"]) < 2):
-                break
+        print(
+            "\nExclusions\n"
+            "  These optional names keep generated data, logs, checkpoints, or secrets\n"
+            "  from being synchronized. Leave blank to use the safe defaults.\n"
+        )
         extra_parts = prompt("Additional excluded directory names (comma-separated)", required=False)
         if extra_parts:
             repo["exclude_parts"] = sorted(
@@ -1038,6 +1343,15 @@ def config_wizard(path: Path) -> None:
             break
     save_config(config, path)
     success(f"Saved {path}")
+    print(
+        "\nChecking which locations already contain each repository. Missing copies\n"
+        "can be cloned from any configured copy that already exists.\n"
+    )
+    if bootstrap_config(config):
+        success("Setup complete")
+        print("  Next: run 'hpsync status' to review your worktrees.")
+    else:
+        warning("Configuration saved, but at least one checkout is still missing")
 
 
 def cmd_config(args: argparse.Namespace) -> int:
@@ -1055,6 +1369,10 @@ def cmd_config(args: argparse.Namespace) -> int:
     if action == "validate":
         load_config(path)
         success(f"Valid configuration: {path}")
+        return 0
+    if action == "bootstrap":
+        config = load_config(path)
+        bootstrap_config(config, args.repositories, args.yes)
         return 0
 
     config = load_config(path, allow_missing=action == "add-repo")
@@ -1120,6 +1438,11 @@ def build_parser() -> argparse.ArgumentParser:
     config_subparsers = config_parser.add_subparsers(dest="config_action")
     for name in ("wizard", "init", "path", "validate"):
         config_subparsers.add_parser(name)
+    bootstrap_parser = config_subparsers.add_parser(
+        "bootstrap", help="create missing checkouts from an existing location"
+    )
+    bootstrap_parser.add_argument("repositories", nargs="*", metavar="REPOSITORY")
+    bootstrap_parser.add_argument("--yes", "-y", action="store_true")
     show_parser = config_subparsers.add_parser("show")
     show_parser.add_argument("--allow-missing", action="store_true")
     add_repo_parser = config_subparsers.add_parser("add-repo")
@@ -1150,6 +1473,9 @@ def main(argv: list[str] | None = None) -> int:
     configure_color(getattr(args, "color", "auto"))
     try:
         return args.func(args)
+    except KeyboardInterrupt:
+        print(f"\n{styled('!', '33')} Cancelled", file=sys.stderr)
+        return 130
     except (ConfigError, OSError, RuntimeError, subprocess.CalledProcessError, ValueError) as error:
         print(f"{styled('✗', '31')} {error}", file=sys.stderr)
         return 1
