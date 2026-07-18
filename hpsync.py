@@ -960,16 +960,21 @@ with tarfile.open(destination, "w:gz", dereference=False) as archive:
 
 
 DELETE_REMOTE = r"""
-import sys
-from pathlib import Path
-path = Path(sys.argv[1]) / sys.argv[2]
-try:
-    if path.is_dir() and not path.is_symlink():
-        path.rmdir()
-    else:
-        path.unlink()
-except FileNotFoundError:
-    pass
+import json, sys
+from pathlib import Path, PurePosixPath
+root = Path(sys.argv[1])
+for item in json.load(sys.stdin):
+    parsed = PurePosixPath(item)
+    if parsed.is_absolute() or not parsed.parts or ".." in parsed.parts:
+        raise RuntimeError(f"Unsafe repository path: {item!r}")
+    path = root / item
+    try:
+        if path.is_dir() and not path.is_symlink():
+            path.rmdir()
+        else:
+            path.unlink()
+    except FileNotFoundError:
+        pass
 """
 
 
@@ -1033,42 +1038,78 @@ def endpoint_command(
     return command if endpoint.location.is_local else connections[endpoint.name].command(command)
 
 
+def delete_paths(
+    paths: list[str],
+    target: Endpoint,
+    connections: dict[str, SshConnection],
+) -> None:
+    if not paths:
+        return
+    for path in paths:
+        validate_path(path)
+    if target.location.is_local:
+        for path in paths:
+            remove_local(target.root, path)
+        return
+    connections[target.name].run(
+        [target.location.python, "-c", DELETE_REMOTE, target.root],
+        input_data=json.dumps(paths).encode(),
+    )
+
+
+def copy_paths(
+    paths: list[str],
+    source: Endpoint,
+    target: Endpoint,
+    connections: dict[str, SshConnection],
+) -> None:
+    unique_paths = sorted(set(paths))
+    for path in unique_paths:
+        validate_path(path)
+    present = [path for path in unique_paths if source.states[path].kind != "missing"]
+    missing = [path for path in unique_paths if source.states[path].kind == "missing"]
+
+    if present:
+        source_command = endpoint_command(
+            source,
+            ["tar", "-C", source.root, "-cf", "-", "--null", "-T", "-"],
+            connections,
+        )
+        target_command = endpoint_command(
+            target, ["tar", "-C", target.root, "-xf", "-"], connections
+        )
+        path_list = b"\0".join(os.fsencode(path) for path in present) + b"\0"
+        source_process = subprocess.Popen(
+            source_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE
+        )
+        assert source_process.stdin is not None
+        assert source_process.stdout is not None
+        target_process = subprocess.Popen(target_command, stdin=source_process.stdout)
+        source_process.stdout.close()
+        try:
+            source_process.stdin.write(path_list)
+        except BrokenPipeError:
+            pass
+        finally:
+            source_process.stdin.close()
+        target_result = target_process.wait()
+        source_result = source_process.wait()
+        if source_result or target_result:
+            raise RuntimeError(
+                f"Failed to copy {len(present)} path(s) "
+                f"from {source.name} to {target.name}"
+            )
+
+    delete_paths(missing, target, connections)
+
+
 def copy_path(
     path: str,
     source: Endpoint,
     target: Endpoint,
     connections: dict[str, SshConnection],
 ) -> None:
-    validate_path(path)
-    state = source.states[path]
-    if state.kind == "missing":
-        if target.location.is_local:
-            remove_local(target.root, path)
-        else:
-            connections[target.name].run(
-                [target.location.python, "-c", DELETE_REMOTE, target.root, path]
-            )
-        return
-
-    parent = str(PurePosixPath(target.root) / PurePosixPath(path).parent)
-    if target.location.is_local:
-        Path(parent).mkdir(parents=True, exist_ok=True)
-    else:
-        connections[target.name].run(["mkdir", "-p", parent])
-
-    source_command = endpoint_command(
-        source, ["tar", "-C", source.root, "-cf", "-", "--", path], connections
-    )
-    target_command = endpoint_command(
-        target, ["tar", "-C", target.root, "-xf", "-"], connections
-    )
-    source_process = subprocess.Popen(source_command, stdout=subprocess.PIPE)
-    assert source_process.stdout is not None
-    target_result = subprocess.run(target_command, stdin=source_process.stdout)
-    source_process.stdout.close()
-    source_result = source_process.wait()
-    if source_result or target_result.returncode:
-        raise RuntimeError(f"Failed to copy {source.name} -> {target.name}: {path}")
+    copy_paths([path], source, target, connections)
 
 
 def apply_plan(
@@ -1082,14 +1123,19 @@ def apply_plan(
     backups = create_backups(repo_name, plan, by_name, connections)
     for name, destination in backups.items():
         print(f"  {name}  {destination}")
-    progress(f"Applying {len(plan.updates)} updates")
-    for index, update in enumerate(plan.updates, 1):
+    grouped: dict[tuple[str, str], list[str]] = {}
+    for update in plan.updates:
+        grouped.setdefault((update.source, update.target), []).append(update.path)
+    progress(
+        f"Applying {len(plan.updates)} updates in {len(grouped)} transfer batch(es)"
+    )
+    for index, ((source, target), paths) in enumerate(grouped.items(), 1):
         print(
-            f"  {styled(f'[{index}/{len(plan.updates)}]', '2')} "
-            f"{update.source} {styled('→', '36')} {update.target}  {update.path}",
+            f"  {styled(f'[{index}/{len(grouped)}]', '2')} "
+            f"{source} {styled('→', '36')} {target}  {len(paths)} path(s)",
             flush=True,
         )
-        copy_path(update.path, by_name[update.source], by_name[update.target], connections)
+        copy_paths(paths, by_name[source], by_name[target], connections)
 
 
 def repo_exclusions(repo: dict[str, Any]) -> tuple[set[str], set[str]]:
@@ -1215,6 +1261,74 @@ def prompt_yes_no(label: str, default: bool = False) -> bool:
     return default if not value else value in {"y", "yes"}
 
 
+class _RestartWizard(Exception):
+    """Restart collection after discarding the most recent wizard answer."""
+
+
+class WizardPrompts:
+    """Interactive prompts that can replay prior answers after going back."""
+
+    def __init__(self) -> None:
+        self.answers: list[str] = []
+        self.position = 0
+
+    def explain(self, message: str) -> None:
+        if self.position >= len(self.answers):
+            print(message)
+
+    def _ask(self, question: str) -> tuple[str, bool]:
+        if self.position < len(self.answers):
+            value = self.answers[self.position]
+            self.position += 1
+            return value, True
+
+        while True:
+            question_separator()
+            value = input(question).strip()
+            if value.lower() != "back":
+                return value, False
+            if not self.answers:
+                warning("Already at the first question")
+                continue
+            self.answers.pop()
+            self.position = 0
+            print(f"{styled('↶', '36')} Returning to the previous question")
+            raise _RestartWizard
+
+    def _remember(self, value: str, replayed: bool) -> None:
+        if not replayed:
+            self.answers.append(value)
+            self.position += 1
+
+    def prompt(
+        self, label: str, default: str | None = None, required: bool = True
+    ) -> str:
+        suffix = f" [{default}]" if default else ""
+        while True:
+            value, replayed = self._ask(f"{label}{suffix}: ")
+            if replayed:
+                return value
+            if value:
+                answer = value
+            elif default is not None:
+                answer = default
+            elif not required:
+                answer = ""
+            else:
+                continue
+            self._remember(answer, replayed)
+            return answer
+
+    def prompt_yes_no(self, label: str, default: bool = False) -> bool:
+        marker = "Y/n" if default else "y/N"
+        value, replayed = self._ask(f"{label} [{marker}]: ")
+        if replayed:
+            return value == "yes"
+        answer = default if not value else value.lower() in {"y", "yes"}
+        self._remember("yes" if answer else "no", replayed)
+        return answer
+
+
 def suggested_local_repo_path(repo_name: str) -> str:
     result = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],
@@ -1231,34 +1345,29 @@ def location_name_from_host(host: str) -> str:
     return host.rsplit("@", 1)[-1].split(".", 1)[0] or "remote"
 
 
-def config_wizard(path: Path) -> None:
-    print(f"\n{title('hpsync configuration')}")
-    print(
-        f"  {path}\n\n"
-        "Setup always includes a local copy. At least one location must already\n"
-        "contain the repository; any other local or remote copies may be missing\n"
-        "and can be created during setup.\n"
-    )
-    if path.exists() and not prompt_yes_no("Replace the existing configuration?"):
+def collect_wizard_config(path: Path, wizard: WizardPrompts) -> dict[str, Any] | None:
+    if path.exists() and not wizard.prompt_yes_no("Replace the existing configuration?"):
         warning("Configuration unchanged")
-        return
+        return None
     config = default_config()
     while True:
-        print(
+        wizard.explain(
             "Repository name is a short label for the project. It does not need "
             "to match GitHub.\n  Example: pimm\n"
         )
-        repo_name = prompt("Repository name", Path.cwd().name)
+        repo_name = wizard.prompt("Repository name", Path.cwd().name)
         add_repo(config, repo_name)
         repo = require_repo(config, repo_name)
 
-        print(
+        wizard.explain(
             "\nLocal copy\n"
             "  hpsync always configures a copy on this computer. The repository path\n"
             "  is the directory where that Git checkout exists or should be created.\n"
             "  Run 'pwd' inside an existing checkout if you are unsure.\n"
         )
-        local_path = prompt("Local repository path", suggested_local_repo_path(repo_name))
+        local_path = wizard.prompt(
+            "Local repository path", suggested_local_repo_path(repo_name)
+        )
         add_location(
             config,
             repo_name,
@@ -1269,78 +1378,109 @@ def config_wizard(path: Path) -> None:
                 "state": DEFAULT_STATE_PATH,
             },
         )
-        print(
+        wizard.explain(
             "  Location name: local (a label for this computer)\n"
             f"  Backup path: {DEFAULT_STATE_PATH} (safety copies before files are replaced)\n"
         )
 
         while True:
-            if not prompt_yes_no(
+            if not wizard.prompt_yes_no(
                 "Add another location?", default=len(repo["locations"]) < 2
             ):
                 if len(repo["locations"]) < 2:
                     warning("At least two locations are needed to synchronize")
                     continue
                 break
-            print(
+            wizard.explain(
                 "\nAnother location\n"
                 "  Transport says how this computer reaches it: 'ssh' for another\n"
                 "  machine or site, and 'local' for another path on this computer.\n"
             )
-            transport = prompt("Transport (ssh/local)", "ssh")
+            transport = wizard.prompt("Transport (ssh/local)", "ssh")
             if transport not in {"local", "ssh"}:
                 warning("Transport must be local or ssh")
                 continue
             host = ""
             if transport == "ssh":
-                host = prompt("SSH host or alias (the name you pass to ssh)")
+                host = wizard.prompt("SSH host or alias (the name you pass to ssh)")
                 default_name = location_name_from_host(host)
             else:
                 default_name = f"local-{len(repo['locations']) + 1}"
-            print("  Location name is only a memorable label, such as nersc or s3df.")
-            location_name = prompt("Location name", default_name)
-            print(
+            wizard.explain(
+                "  Location name is only a memorable label, such as nersc or s3df."
+            )
+            location_name = wizard.prompt("Location name", default_name)
+            wizard.explain(
                 "  Repository path is where this same Git repository exists or should\n"
                 "  be created at that location.\n"
             )
             location: dict[str, Any] = {
                 "name": location_name,
                 "transport": transport,
-                "path": prompt("Repository path"),
+                "path": wizard.prompt("Repository path"),
             }
             if transport == "ssh":
                 location["host"] = host
-                print(
+                wizard.explain(
                     "  Backup path stores safety archives on that machine. A scratch\n"
                     "  directory is a good choice on an HPC system.\n"
                 )
-                location["state"] = prompt("Backup path", DEFAULT_STATE_PATH)
-                port = prompt("SSH port", required=False)
+                location["state"] = wizard.prompt("Backup path", DEFAULT_STATE_PATH)
+                port = wizard.prompt("SSH port", required=False)
                 if port:
                     location["port"] = int(port)
-                auth = prompt("Authentication refresh command", required=False)
+                auth = wizard.prompt("Authentication refresh command", required=False)
                 if auth:
                     location["auth_command"] = shlex.split(auth)
             else:
                 location["state"] = DEFAULT_STATE_PATH
             add_location(config, repo_name, location)
-        print(
+        wizard.explain(
             "\nExclusions\n"
             "  These optional names keep generated data, logs, checkpoints, or secrets\n"
             "  from being synchronized. Leave blank to use the safe defaults.\n"
         )
-        extra_parts = prompt("Additional excluded directory names (comma-separated)", required=False)
+        extra_parts = wizard.prompt(
+            "Additional excluded directory names (comma-separated)", required=False
+        )
         if extra_parts:
             repo["exclude_parts"] = sorted(
-                set(repo["exclude_parts"]).union(item.strip() for item in extra_parts.split(",") if item.strip())
+                set(repo["exclude_parts"]).union(
+                    item.strip() for item in extra_parts.split(",") if item.strip()
+                )
             )
-        extra_names = prompt("Additional excluded file names (comma-separated)", required=False)
+        extra_names = wizard.prompt(
+            "Additional excluded file names (comma-separated)", required=False
+        )
         if extra_names:
             repo["exclude_names"] = sorted(
-                set(repo["exclude_names"]).union(item.strip() for item in extra_names.split(",") if item.strip())
+                set(repo["exclude_names"]).union(
+                    item.strip() for item in extra_names.split(",") if item.strip()
+                )
             )
-        if not prompt_yes_no("Add another repository?"):
+        if not wizard.prompt_yes_no("Add another repository?"):
             break
+    return config
+
+
+def config_wizard(path: Path) -> None:
+    print(f"\n{title('hpsync configuration')}")
+    print(
+        f"  {path}\n\n"
+        "Setup always includes a local copy. At least one location must already\n"
+        "contain the repository; any other local or remote copies may be missing\n"
+        "and can be created during setup.\n"
+        "Type 'back' at any question to redo the previous answer.\n"
+    )
+    wizard = WizardPrompts()
+    while True:
+        try:
+            config = collect_wizard_config(path, wizard)
+            break
+        except _RestartWizard:
+            continue
+    if config is None:
+        return
     save_config(config, path)
     success(f"Saved {path}")
     print(

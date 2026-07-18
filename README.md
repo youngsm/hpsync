@@ -20,8 +20,9 @@ Before changing anything, `hpsync`:
 6. creates a compressed backup at every location that will be modified;
 7. verifies that all worktrees converge after the transfer.
 
-Files are copied directly between worktrees. `hpsync` does not commit, pull,
-push, reset, or modify Git history.
+Files are copied directly between worktrees. Paths sharing a source and target
+are packed into one tar stream, avoiding an SSH round trip for every file.
+`hpsync` does not commit, pull, push, reset, or modify Git history.
 
 ## Install
 
@@ -43,7 +44,8 @@ hpsync config
 ```
 
 The wizard separates each question with a terminal-width dim gray rule and
-explains each value as it asks for it. In short:
+explains each value as it asks for it. Type `back` at any question to discard
+the previous answer and ask that question again. In short:
 
 - **Repository name** is a label for the project, such as `pimm`.
 - **Location name** is a label for a computer or site, such as `local`, `nersc`,
