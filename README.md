@@ -1,5 +1,7 @@
 # hpsync = hpc + sync
 
+[![codecov](https://codecov.io/gh/youngsm/hpsync/graph/badge.svg)](https://codecov.io/gh/youngsm/hpsync)
+
 `hpsync` safely synchronizes
 uncommitted Git work across any number of worktrees on your local computer
 and SSH-accessible machines.
