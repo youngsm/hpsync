@@ -30,7 +30,7 @@ Python 3.10 or newer is required on the computer running `hpsync`. SSH
 locations need `python3`, `git`, and `tar`.
 
 ```sh
-python -m pip install --user hpsync
+pip install hpsync
 ```
 
 The command is installed as `hpsync`.
