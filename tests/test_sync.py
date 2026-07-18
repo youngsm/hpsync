@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import hpsync
 
@@ -82,8 +84,128 @@ class SshCommandTests(unittest.TestCase):
         self.assertIn("user@example.com", command)
         self.assertIn("python3 -c", command[-1])
 
+    def test_deletes_remote_paths_in_one_command(self) -> None:
+        target = hpsync.Endpoint(
+            hpsync.Location(
+                "cluster",
+                "/work/project",
+                "ssh",
+                host="user@example.com",
+            ),
+            "/work/project",
+            "abc",
+            "main",
+            "",
+            {},
+            {},
+            [],
+        )
+        connection = mock.Mock()
+
+        hpsync.delete_paths(
+            ["deleted-one.txt", "nested/deleted-two.txt"],
+            target,
+            {"cluster": connection},
+        )
+
+        connection.run.assert_called_once()
+        self.assertEqual(
+            connection.run.call_args.kwargs["input_data"],
+            b'["deleted-one.txt", "nested/deleted-two.txt"]',
+        )
+
 
 class LocalSyncTests(unittest.TestCase):
+    def test_copies_mixed_paths_in_one_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_root = root / "source"
+            target_root = root / "target"
+            (source_root / "nested").mkdir(parents=True)
+            target_root.mkdir()
+            (source_root / "nested" / "file.txt").write_text("nested\n")
+            (source_root / "with space.txt").write_text("space\n")
+            executable = source_root / "-executable"
+            executable.write_text("#!/bin/sh\n")
+            executable.chmod(0o755)
+            (source_root / "link").symlink_to("nested/file.txt")
+            (target_root / "deleted.txt").write_text("remove me\n")
+            paths = [
+                "nested/file.txt",
+                "with space.txt",
+                "-executable",
+                "link",
+                "deleted.txt",
+            ]
+            states = {
+                path: hpsync.file_state(str(source_root), path) for path in paths
+            }
+            source = hpsync.Endpoint(
+                hpsync.Location("source", str(source_root), "local"),
+                str(source_root),
+                "abc",
+                "main",
+                "",
+                {},
+                states,
+                [],
+            )
+            target = hpsync.Endpoint(
+                hpsync.Location("target", str(target_root), "local"),
+                str(target_root),
+                "abc",
+                "main",
+                "",
+                {},
+                {},
+                [],
+            )
+
+            hpsync.copy_paths(paths, source, target, {})
+
+            self.assertEqual((target_root / "nested" / "file.txt").read_text(), "nested\n")
+            self.assertEqual((target_root / "with space.txt").read_text(), "space\n")
+            self.assertTrue(os.access(target_root / "-executable", os.X_OK))
+            self.assertTrue((target_root / "link").is_symlink())
+            self.assertEqual(os.readlink(target_root / "link"), "nested/file.txt")
+            self.assertFalse((target_root / "deleted.txt").exists())
+
+    def test_apply_plan_groups_updates_by_source_and_target(self) -> None:
+        endpoints = [
+            hpsync.Endpoint(
+                hpsync.Location(name, f"/{name}", "local"),
+                f"/{name}",
+                "abc",
+                "main",
+                "",
+                {},
+                {},
+                [],
+            )
+            for name in ("source", "other", "target")
+        ]
+        plan = hpsync.SyncPlan(
+            updates=[
+                hpsync.Update("one.txt", "source", "target"),
+                hpsync.Update("two.txt", "source", "target"),
+                hpsync.Update("three.txt", "other", "target"),
+            ],
+            conflicts=[],
+            converged=[],
+            excluded=[],
+        )
+
+        with (
+            mock.patch.object(hpsync, "create_backups", return_value={}),
+            mock.patch.object(hpsync, "copy_paths") as copy_paths,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            hpsync.apply_plan("project", plan, endpoints, {})
+
+        self.assertEqual(copy_paths.call_count, 2)
+        self.assertEqual(copy_paths.call_args_list[0].args[0], ["one.txt", "two.txt"])
+        self.assertEqual(copy_paths.call_args_list[1].args[0], ["three.txt"])
+
     def test_bootstrap_creates_a_missing_local_checkout_without_an_origin(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

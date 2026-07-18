@@ -140,6 +140,46 @@ class ConfigTests(unittest.TestCase):
             bootstrap.assert_called_once_with(config)
             self.assertIn("Setup always includes a local copy", output.getvalue())
 
+    def test_wizard_can_go_back_and_change_a_conditional_answer(self) -> None:
+        answers = iter(
+            [
+                "project",
+                "/tmp/local-project",
+                "",
+                "ssh",
+                "back",
+                "local",
+                "",
+                "/tmp/second-project",
+                "",
+                "",
+                "",
+                "",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            output = io.StringIO()
+            with (
+                mock.patch("builtins.input", side_effect=lambda _prompt: next(answers)),
+                mock.patch.object(hpsync, "bootstrap_config", return_value=True),
+                contextlib.redirect_stdout(output),
+            ):
+                hpsync.config_wizard(path)
+
+            locations = hpsync.load_config(path)["repositories"][0]["locations"]
+            self.assertEqual(
+                locations[1],
+                {
+                    "name": "local-2",
+                    "transport": "local",
+                    "path": "/tmp/second-project",
+                    "state": "~/.local/state/hpsync",
+                },
+            )
+            self.assertIn("Returning to the previous question", output.getvalue())
+            self.assertIn("Type 'back'", output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
