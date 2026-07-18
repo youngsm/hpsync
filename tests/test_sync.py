@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import hpsync
+from hpsync import cli as hpsync
 
 
 def git(repo: Path, *args: str) -> None:
