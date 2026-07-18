@@ -30,7 +30,7 @@ Python 3.10 or newer is required on the computer running `hpsync`. SSH
 locations need `python3`, `git`, and `tar`.
 
 ```sh
-python -m pip install --user .
+python -m pip install --user hpsync
 ```
 
 The command is installed as `hpsync`.
@@ -180,6 +180,7 @@ If locations have different `HEAD` commits, you must align them with your normal
 ## Development
 
 ```sh
+python -m pip install -e .
 python -m unittest discover -v
 ```
 

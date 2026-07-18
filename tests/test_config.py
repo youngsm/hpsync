@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import hpsync
+from hpsync import cli as hpsync
 
 
 class ConfigTests(unittest.TestCase):

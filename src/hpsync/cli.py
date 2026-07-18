@@ -1,5 +1,9 @@
-#!/usr/bin/env python3
-"""Safely synchronize uncommitted work across local and SSH Git worktrees."""
+"""Safely synchronize uncommitted work across local and SSH Git worktrees.
+
+A sync follows one guarded pipeline: inspect, plan, re-inspect, back up, apply,
+and verify. Remote work runs through reusable SSH connections and small inline
+Python programs, so hpsync itself only needs to be installed locally.
+"""
 
 from __future__ import annotations
 
@@ -70,6 +74,8 @@ class ConfigError(RuntimeError):
 
 @dataclasses.dataclass(frozen=True)
 class FileState:
+    """Content identity and relevant metadata for one worktree path."""
+
     kind: str
     digest: str = ""
     executable: bool = False
@@ -93,6 +99,8 @@ class Location:
 
 @dataclasses.dataclass
 class Endpoint:
+    """Snapshot of one configured worktree during an inspection pass."""
+
     location: Location
     root: str
     head: str
@@ -116,6 +124,8 @@ class Update:
 
 @dataclasses.dataclass
 class SyncPlan:
+    """Safe updates and blocked paths derived from endpoint snapshots."""
+
     updates: list[Update]
     conflicts: list[str]
     converged: list[str]
@@ -438,6 +448,8 @@ def probe_local(location: Location, extra_paths: set[str] | None = None) -> Endp
     )
 
 
+# REMOTE_* programs are sent over SSH with ``python -c``. Keeping them
+# self-contained avoids requiring an hpsync installation on remote machines.
 REMOTE_PROBE = r"""
 import base64, hashlib, json, os, stat, subprocess, sys
 from pathlib import Path
@@ -494,6 +506,8 @@ print(json.dumps({"root": root, "head": os.fsdecode(git("rev-parse", "HEAD")).st
 
 
 class SshConnection:
+    """SSH command runner that reuses one temporary ControlMaster socket."""
+
     def __init__(self, location: Location):
         if not location.host:
             raise ConfigError(f"SSH location {location.name} has no host")
@@ -805,6 +819,12 @@ def probe_remote(
 def inspect_locations(
     locations: list[Location], connections: dict[str, SshConnection]
 ) -> list[Endpoint]:
+    """Snapshot every worktree, then fill in states for paths dirty elsewhere.
+
+    The second pass is necessary because a clean worktree's first probe does
+    not hash paths that are changed at another location.
+    """
+
     first: list[Endpoint] = []
     for location in locations:
         progress(f"Inspecting {location.name}")
@@ -829,6 +849,8 @@ def inspect_locations(
 def make_plan(
     endpoints: list[Endpoint], excluded_parts: set[str], excluded_names: set[str]
 ) -> SyncPlan:
+    """Choose one agreed changed state per path, or mark the path conflicted."""
+
     updates: list[Update] = []
     conflicts: list[str] = []
     converged: list[str] = []
@@ -997,6 +1019,8 @@ def create_backups(
     endpoints: dict[str, Endpoint],
     connections: dict[str, SshConnection],
 ) -> dict[str, str]:
+    """Archive every target path before that target is modified."""
+
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     targets: dict[str, list[str]] = {}
     for update in plan.updates:
@@ -1063,6 +1087,12 @@ def copy_paths(
     target: Endpoint,
     connections: dict[str, SshConnection],
 ) -> None:
+    """Apply one source-to-target batch with one tar stream.
+
+    A NUL-delimited file list avoids shell limits and quoting problems. Missing
+    source paths are deleted only after the archive transfer succeeds.
+    """
+
     unique_paths = sorted(set(paths))
     for path in unique_paths:
         validate_path(path)
@@ -1118,6 +1148,8 @@ def apply_plan(
     endpoints: list[Endpoint],
     connections: dict[str, SshConnection],
 ) -> None:
+    """Back up targets, group updates by route, and apply each route once."""
+
     by_name = {endpoint.name: endpoint for endpoint in endpoints}
     progress("Creating safety backups")
     backups = create_backups(repo_name, plan, by_name, connections)
@@ -1266,7 +1298,12 @@ class _RestartWizard(Exception):
 
 
 class WizardPrompts:
-    """Interactive prompts that can replay prior answers after going back."""
+    """Prompt history that supports rebuilding a draft after ``back``.
+
+    Accepted answers are replayed without prompting. Entering ``back`` removes
+    the latest answer and restarts collection, so conditional branches and
+    partially built configuration never need bespoke undo logic.
+    """
 
     def __init__(self) -> None:
         self.answers: list[str] = []
@@ -1346,6 +1383,8 @@ def location_name_from_host(host: str) -> str:
 
 
 def collect_wizard_config(path: Path, wizard: WizardPrompts) -> dict[str, Any] | None:
+    """Collect and validate a complete in-memory configuration draft."""
+
     if path.exists() and not wizard.prompt_yes_no("Replace the existing configuration?"):
         warning("Configuration unchanged")
         return None
